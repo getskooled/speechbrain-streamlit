@@ -1,147 +1,79 @@
-import io
-import pydub
-import resampy
-
-import librosa
-import librosa.display
-
+import os
 import streamlit as st
-import numpy as np
-
-from matplotlib import pyplot as plt
-from scipy.io import wavfile
-
-import torch
-import torchaudio
+import boto3
+import time
+from moviepy.editor import VideoFileClip
 import speechbrain as sb
+import torchaudio
 
-from speechbrain.pretrained import EncoderDecoderASR
-from speechbrain.pretrained import SpectralMaskEnhancement
+AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+UPLOAD_AWS_BUCKET_NAME = os.environ["UPLOAD_AWS_BUCKET_NAME"]
+MAX_TRANSCRIPTION_ATTEMPTS = 4
 
-SAMPLE_RATE = 16000
-
-asr_model = EncoderDecoderASR.from_hparams(source="speechbrain/asr-wav2vec2-commonvoice-en",
-                                          savedir="asr-wav2vec2-commonvoice-en")
-
-enhancer = SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
-                                                 savedir="tmp_dir")
-
-
-plt.rcParams["figure.figsize"] = (12, 10)
-
-
-def create_audio_player(audio_data, sample_rate):
-    virtualfile = io.BytesIO()
-    wavfile.write(virtualfile, rate=sample_rate, data=audio_data)
-    return virtualfile
-
-@st.cache
-def handle_uploaded_audio_file(uploaded_file):
-    a = pydub.AudioSegment.from_file(
-        file=uploaded_file, format=uploaded_file.name.split(".")[-1]
+def s3_client():
+    return boto3.client(
+        service_name='s3',
+        region_name='eu-west-1',
+        aws_access_key_id=AWS_ACCESS_KEY_ID.strip(),
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY.strip()
     )
 
-    channel_sounds = a.split_to_mono()
-    samples = [s.get_array_of_samples() for s in channel_sounds]
+def upload_file_to_bucket(file_path, bucket, file_name):
+    s3 = s3_client()
+    try:
+        s3.upload_file(file_path, bucket, file_name)
+        st.success("File Successfully Uploaded")
+        return True
+    except FileNotFoundError:
+        st.error("File not found")
+        return False
 
-    fp_arr = np.array(samples).T.astype(np.float32)
-    fp_arr /= np.iinfo(samples[0].typecode).max
+def extract_audio_from_video(video_file):
+    video = VideoFileClip(video_file)
+    audio_file = "audio.wav"
+    audio = video.audio
+    audio.write_audiofile(audio_file)
+    return audio_file
 
-    return fp_arr[:, 0], a.frame_rate
-
-def add_h_space():
-    st.markdown("<br></br>", unsafe_allow_html=True)
-
-def plot_wave(source, sample_rate):
-    fig, ax = plt.subplots()
-    img = librosa.display.waveshow(source, sr=sample_rate, x_axis="time", ax=ax)
-    return plt.gcf()
-
-def do_audio_processing(source, sample_rate, option):
-
-    batch = source.unsqueeze(0)
-    rel_length = torch.tensor([1.0])
-
-    if option == 'Speech Recognition':
-        st.markdown(
-        f"<h4 style='text-align: center; color: black;'>Audio</h5>",
-        unsafe_allow_html=True,)
-
-        st.audio(create_audio_player(source.cpu().detach().numpy(), sample_rate))
-        result = asr_model.transcribe_batch(batch, rel_length)
-        st.markdown("---")
-        st.write(result)
-
-    elif option == 'Speech Enhancement':
-        cols = [1, 1]
-        col1, col2 = st.columns(cols)
-
-        with col1:
-            st.markdown(
-                f"<h4 style='text-align: center; color: black;'>Original</h5>",
-                unsafe_allow_html=True,
-            )
-            st.audio(create_audio_player(source.cpu().detach().numpy(), sample_rate))
-        with col2:
-            st.markdown(
-                f"<h4 style='text-align: center; color: black;'>Wave plot </h5>",
-                unsafe_allow_html=True,
-            )
-            st.pyplot(plot_wave(source.cpu().detach().numpy(), sample_rate))
-            add_h_space()
-
-        cols = [1, 1]
-        col1, col2 = st.columns(cols)
-        enhanced = enhancer.enhance_batch(batch, rel_length)
-        enhanced = enhanced.cpu().detach().numpy()
-        with col1:
-            st.markdown(
-                f"<h4 style='text-align: center; color: black;'>Original</h5>",
-                unsafe_allow_html=True,
-            )
-            st.audio(create_audio_player(np.transpose(enhanced, (1,0)), sample_rate))
-        with col2:
-            st.markdown(
-                f"<h4 style='text-align: center; color: black;'>Wave plot </h5>",
-                unsafe_allow_html=True,
-            )
-            st.pyplot(plot_wave(enhanced, sample_rate))
-            add_h_space()
-
-def action(file_uploader, option):
-    if file_uploader is not None:
-      source, sample_rate = handle_uploaded_audio_file(file_uploader)
-      source = resampy.resample(source, sample_rate, SAMPLE_RATE, axis=0, filter='kaiser_best')
-      source = torch.FloatTensor(source)
-      do_audio_processing(source, SAMPLE_RATE, option)
+def transcribe_audio_with_speechbrain(audio_file):
+    # Load pre-trained ASR model
+    asr_model = sb.models.CRDNN.from_hparams(
+        source="speechbrain/asr-crdnn-rnnlm-librispeech",
+        savedir="tmpdir",
+    )
+    # Load audio file
+    signal, fs = torchaudio.load(audio_file)
+    # Transcribe audio
+    transcription = asr_model.encode_text(signal)
+    return transcription
 
 def main():
-    placeholder = st.empty()
-    placeholder2 = st.empty()
-    placeholder.markdown(
-        "# Processing of sound and speech by SpeechBrain framework\n"
-        "### Select the processing procedure in the sidebar.\n"
-        "Once you have chosen processing procedure, select or upload an audio file\n. "
-        'Then click "Apply" to start! \n\n'
-    )
-    placeholder2.markdown(
-        "After clicking start,the result of the selected procedure are visualized."
-    )
+    st.set_page_config(page_title="Transcription AI Demo")
+    st.header("Transcription AI Demo")
 
-    option = st.sidebar.selectbox('Audio Processing Task', options=('Speech Recognition', 'Speech Enhancement'))
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("(Optional) Upload an audio file here:")
-    file_uploader = st.sidebar.file_uploader(
-        label="", type=[".wav", ".wave", ".flac", ".mp3", ".ogg"]
-    )
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Apply"):
-        placeholder.empty()
-        placeholder2.empty()
-        action(file_uploader=file_uploader,
-               option=option)
+    vid = st.file_uploader("Upload your video", type="mp4")
+    if vid is not None:
+        transcription_attempts = 1
+        video_path = os.path.join("/tmp", vid.name)
+        with open(video_path, "wb") as f:
+            f.write(vid.read())
 
+        upload_file_to_bucket(video_path, UPLOAD_AWS_BUCKET_NAME, vid.name)
+        audio_file = extract_audio_from_video(video_path)
+        
+        while transcription_attempts < MAX_TRANSCRIPTION_ATTEMPTS:
+            with st.spinner("Transcribing..."):
+                time.sleep(5)
+            try:
+                transcription = transcribe_audio_with_speechbrain(audio_file)
+                st.success("Transcription Successful")
+                st.header("Transcription")
+                st.markdown(transcription)
+                break
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+                transcription_attempts += 1
 
 if __name__ == "__main__":
-    st.set_page_config(layout="wide", page_title="Speech brain audio file processing")
     main()
