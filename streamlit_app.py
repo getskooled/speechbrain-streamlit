@@ -1,5 +1,3 @@
-!pip install openai
-
 import openai
 import torchaudio
 import streamlit as st
